@@ -1,51 +1,53 @@
 import asyncio
 import websockets
 import os
+import http
 
 # This set will store all connected client websockets
 CONNECTED_CLIENTS = set()
+
+async def health_check(connection, request):
+    """
+    This function handles incoming HTTP requests before they become WebSockets.
+    Render sends 'HEAD' or 'GET' requests to check if the app is running.
+    We answer these with a simple '200 OK' so Render knows we are alive.
+    """
+    if request.path == "/healthz" or request.method == "HEAD":
+        return http.HTTPStatus.OK, [], b"OK\n"
+    # Return None to tell the library: "This isn't a health check, proceed with WebSocket handshake"
+    return None
 
 async def handler(websocket):
     """
     Handle a new client connection.
     """
     print(f"New client connected: {websocket.remote_address}")
-    # Add the new client to our set
     CONNECTED_CLIENTS.add(websocket)
     
     try:
-        # This loop runs forever for each client
-        # It waits for a message and then processes it
         async for message in websocket:
-            print(f"Received message from {websocket.remote_address}: {message}")
+            print(f"Received message: {message}")
             
-            # We want to send this message to all *other* clients
-            clients_to_send = [client for client in CONNECTED_CLIENTS if client != websocket]
+            # improved broadcasting: send to everyone EXCEPT the sender
+            # We verify the client is still in the set before sending
+            other_clients = {client for client in CONNECTED_CLIENTS if client != websocket}
             
-            # If there are other clients, send the message
-            if clients_to_send:
-                # This creates a list of tasks to run concurrently
-                await asyncio.wait([client.send(message) for client in clients_to_send])
+            if other_clients:
+                # websockets.broadcast is much more stable than writing our own loop
+                websockets.broadcast(other_clients, message)
                 
     except websockets.exceptions.ConnectionClosed:
-        print(f"Client disconnected: {websocket.remote_address}")
+        print("A client disconnected")
     finally:
-        # When the client disconnects (or an error occurs), remove them
-        CONNECTED_CLIENTS.remove(websocket)
+        CONNECTED_CLIENTS.discard(websocket)
 
 async def main():
-    """
-    Start the WebSocket server.
-    """
-    # Get the port from the environment variable (for deployment)
-    # Default to 8080 for local testing
     port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server on port {port}...")
     
-    print(f"Starting WebSocket server on port {port}...")
-    
-    # "0.0.0.0" means it will listen on all available network interfaces
-    async with websockets.serve(handler, "0.0.0.0", port):
-        await asyncio.Future()  # This runs the server forever
+    # We add 'process_request=health_check' to handle the Render pings
+    async with websockets.serve(handler, "0.0.0.0", port, process_request=health_check):
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
