@@ -1,53 +1,54 @@
-import asyncio
-import websockets
+from aiohttp import web
 import os
-import http
 
-# This set will store all connected client websockets
+# Store connected clients
 CONNECTED_CLIENTS = set()
 
-async def health_check(connection, request):
+async def handler(request):
     """
-    This function handles incoming HTTP requests before they become WebSockets.
-    Render sends 'HEAD' or 'GET' requests to check if the app is running.
-    We answer these with a simple '200 OK' so Render knows we are alive.
+    This single function handles BOTH health checks and WebSocket connections.
     """
-    if request.path == "/healthz" or request.method == "HEAD":
-        return http.HTTPStatus.OK, [], b"OK\n"
-    # Return None to tell the library: "This isn't a health check, proceed with WebSocket handshake"
-    return None
+    # 1. Check if this is a WebSocket connection attempt
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        print("Client connected")
+        CONNECTED_CLIENTS.add(ws)
 
-async def handler(websocket):
-    """
-    Handle a new client connection.
-    """
-    print(f"New client connected: {websocket.remote_address}")
-    CONNECTED_CLIENTS.add(websocket)
-    
-    try:
-        async for message in websocket:
-            print(f"Received message: {message}")
-            
-            # improved broadcasting: send to everyone EXCEPT the sender
-            # We verify the client is still in the set before sending
-            other_clients = {client for client in CONNECTED_CLIENTS if client != websocket}
-            
-            if other_clients:
-                # websockets.broadcast is much more stable than writing our own loop
-                websockets.broadcast(other_clients, message)
-                
-    except websockets.exceptions.ConnectionClosed:
-        print("A client disconnected")
-    finally:
-        CONNECTED_CLIENTS.discard(websocket)
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    print(f"Received: {msg.data}")
+                    # Broadcast to all other clients
+                    for client in CONNECTED_CLIENTS:
+                        if client != ws:
+                            # aiohttp handles errors (like disconnected clients) gracefully here
+                            await client.send_str(msg.data)
+                elif msg.type == web.WSMsgType.ERROR:
+                    print('ws connection closed with exception %s', ws.exception())
+
+        finally:
+            CONNECTED_CLIENTS.remove(ws)
+            print("Client disconnected")
+        
+        return ws
+
+    # 2. If it's NOT a WebSocket (e.g. Render health check), just return text
+    else:
+        return web.Response(text="Signaling Server is running!")
 
 async def main():
+    # Get the port from Render
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting server on port {port}...")
     
-    # We add 'process_request=health_check' to handle the Render pings
-    async with websockets.serve(handler, "0.0.0.0", port, process_request=health_check):
-        await asyncio.Future()
+    app = web.Application()
+    # Route all traffic ('/') to our handler function
+    app.add_routes([web.get('/', handler)])
+    
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 8080))
+    # aiohttp's way of starting the server
+    web.run_app(main(), port=port)
